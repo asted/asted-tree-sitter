@@ -91,6 +91,7 @@ dependencies = [
  "dashmap",
  "flatbuffers",
  "glob",
+ "http",
  "once_cell",
  "tokio",
  "tree-sitter",

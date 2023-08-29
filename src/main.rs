@@ -11,7 +11,7 @@ use axum::{
 	body::Bytes,
 	http::StatusCode,
 	response::{IntoResponse, Response},
-	routing::get,
+	routing::post,
 	Router,
 };
 use clap::Parser as ClapParser;
@@ -89,7 +89,12 @@ async fn handle(body: Bytes) -> Result<Response> {
 		}
 		RequestUnion::FileRequest => {
 			let req = unsafe { FileRequest::init_from_table(req.request()) };
-			let path = Path::new(req.path());
+
+			let uri = req.path().parse::<http::Uri>().context("Failed to parse URI")?;
+			if uri.scheme_str() != Some("file") {
+				return Err(Error::UnknownFile(format!("Unsupported URI scheme: {:?}", uri.scheme_str())).into());
+			}
+			let path = Path::new(uri.path());
 
 			if path.is_dir() {
 				return Err(Error::UnknownFile(format!("{} is a directory!", path.display())).into());
@@ -153,7 +158,7 @@ async fn main() {
 		},
 	);
 
-	let app = Router::new().route("/", get(handler));
+	let app = Router::new().route("/", post(handler));
 
 	let addr = match format!("{}:{}", args.host, args.port).parse::<SocketAddr>() {
 		Ok(addr) => addr,
