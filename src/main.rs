@@ -2,7 +2,7 @@ use std::{
 	collections::HashMap,
 	fs,
 	net::SocketAddr,
-	path::Path,
+	path::PathBuf,
 	sync::{Mutex, RwLock},
 };
 
@@ -16,10 +16,10 @@ use axum::{
 };
 use clap::Parser as ClapParser;
 use dashmap::DashMap;
-use flatbuffers;
-use message_generated::asted::interface::{FileRequest, InitRequest, Request, RequestUnion};
+use message_generated::asted::interface::{FileRequest, InitRequest, RequestUnion};
 use once_cell::sync::Lazy;
 use tree_sitter::Parser;
+use url::Url;
 
 #[allow(dead_code, unused_imports)]
 mod message_generated;
@@ -27,7 +27,7 @@ mod tree_serialize;
 
 struct State {
 	parser: Mutex<Parser>,
-	files: HashMap<Box<Path>, RwLock<tree_sitter::Tree>>,
+	files: HashMap<PathBuf, RwLock<tree_sitter::Tree>>,
 }
 
 static STATE_MAP: Lazy<DashMap<String, State>> = Lazy::new(|| DashMap::new());
@@ -64,9 +64,12 @@ impl IntoResponse for Error {
 impl std::error::Error for Error {}
 
 async fn handle(body: Bytes) -> Result<Response> {
-	let req = flatbuffers::root::<Request>(&body).context("Failed to decode request")?;
+	let req = message_generated::asted::interface::root_as_request(&body)
+		.context("Failed to parse request")?;
 
 	let mut state = STATE_MAP.get_mut("global").unwrap();
+
+	println!("handling request: {:?}", req);
 
 	match req.request_type() {
 		RequestUnion::InitRequest => {
@@ -90,35 +93,51 @@ async fn handle(body: Bytes) -> Result<Response> {
 		RequestUnion::FileRequest => {
 			let req = unsafe { FileRequest::init_from_table(req.request()) };
 
-			let uri = req.path().parse::<http::Uri>().context("Failed to parse URI")?;
-			if uri.scheme_str() != Some("file") {
-				return Err(Error::UnknownFile(format!("Unsupported URI scheme: {:?}", uri.scheme_str())).into());
+			let uri = Url::parse(req.path()).context("Failed to parse URI")?;
+			if uri.scheme() != "file" {
+				return Err(Error::UnknownFile(format!(
+					"Unsupported URI scheme: {:?}",
+					uri.scheme()
+				))
+				.into());
 			}
-			let path = Path::new(uri.path());
+			let path = uri
+				.to_file_path()
+				.map_err(|_| Error::UnknownFile(format!("Invalid file path: {}", uri.path())))?;
 
 			if path.is_dir() {
-				return Err(Error::UnknownFile(format!("{} is a directory!", path.display())).into());
+				return Err(
+					Error::UnknownFile(format!("{} is a directory!", path.display())).into(),
+				);
 			}
 			if !path.is_file() {
-				return Err(Error::UnknownFile(format!("File not found: {}", path.display())).into());
+				return Err(
+					Error::UnknownFile(format!("File not found: {}", path.display())).into(),
+				);
 			}
 
-			let text = fs::read_to_string(path).context("Error reading file")?;
+			let text = fs::read_to_string(&path).context("Error reading file")?;
 			let utf16_text = text.encode_utf16().collect::<Vec<u16>>();
 
 			let tree = {
-				let old_tree = state.files.get(path).map(|v| v.read().unwrap());
+				let old_tree = state.files.get(&path).map(|v| v.read().unwrap());
 				state
 					.parser
 					.lock()
 					.unwrap()
 					.parse_utf16(&utf16_text, old_tree.as_deref())
-					.unwrap()
+					.context("Error parsing file")?
 			};
 
 			let res = tree_serialize::serialize(&utf16_text, &tree);
 
+			let file_resp =
+				flatbuffers::root::<message_generated::asted::interface::FileResponse>(&res);
+			println!("file_resp: {:?}", file_resp);
+
 			state.files.insert(path.into(), RwLock::new(tree));
+
+			println!("sending buffer");
 
 			Ok(res.into_response())
 		}
@@ -130,9 +149,17 @@ async fn handle(body: Bytes) -> Result<Response> {
 }
 
 async fn handler(body: Bytes) -> Response {
+	println!("got request to /");
 	match handle(body).await {
 		Ok(r) => r,
-		Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+		Err(e) => {
+			println!("Error handling request: {}", e);
+			println!(
+				"Underlying error: {}",
+				e.source().map_or("None".to_string(), |e| e.to_string())
+			);
+			(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+		}
 	}
 }
 
